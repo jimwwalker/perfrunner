@@ -357,6 +357,31 @@ class PathoGenFrozenTest(PathoGenTest):
                           bucket=target.bucket, password=target.password)
             pg.run()
 
+class KeyFraggerTest(PathoGenTest):
+
+    @with_stats
+    def access(self):
+        for target in self.target_iterator:
+            pg = KeyFragger(num_items=self.test_config.load_settings.items,
+                          num_workers=self.test_config.load_settings.workers,
+                          num_iterations=self.test_config.load_settings.iterations,
+                          frozen_mode=False,
+                          host=target.node, port=8091,
+                          bucket=target.bucket, password=target.password)
+            pg.run()
+
+class KeyFraggerFrozenTest(PathoGenTest):
+
+    @with_stats
+    def access(self):
+        for target in self.target_iterator:
+            pg = KeyFragger(num_items=self.test_config.load_settings.items,
+                          num_workers=self.test_config.load_settings.workers,
+                          num_iterations=self.test_config.load_settings.iterations,
+                          frozen_mode=True,
+                          host=target.node, port=8091,
+                          bucket=target.bucket, password=target.password)
+            pg.run()
 
 class ThroughputTest(KVTest):
 

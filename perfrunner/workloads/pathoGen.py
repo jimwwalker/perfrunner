@@ -226,7 +226,8 @@ class Worker(multiprocessing.Process):
         self.client = Couchbase.connect(host=self.host,
                                         port=self.port,
                                         bucket=self.bucket,
-                                        password=self.password)
+                                        password=self.password,
+                                        username="Administrator")
 
     def run(self):
         """Run a Worker.
@@ -371,3 +372,9 @@ class Supervisor(Worker):
         # Finally, set all remaining documents back to size zero.
         for (i, size) in list(finished_items):
             self._set_with_retry('doc_' + str(i), self.buffer[:0])
+
+if __name__ == '__main__':
+    # Small smoketest
+    PathoGen(num_items=5000, num_workers=17, num_iterations=10,
+             frozen_mode=True, host='localhost', port=9000,
+             bucket='bucket-1', password='asdasd').run()
