@@ -28,7 +28,7 @@ processing queues to form a ring.
 Also distribute the entire key space amongst the workers, essentially just give
 each worker an even slice of the overall key indexes. When the Worker is created
 it always sets all of its documents, and when the Worker terminates it does the
-same, thus at the start/end of the test we should have exactly num_indexes *
+same, thus at the start/end of the test we should have exactly num_items *
 SIZES keys all with fixed values. During the tests run time the item count
 fluctuates as Workers delete and set in the key space.
 
@@ -117,15 +117,12 @@ SIZES1 = (8,  # Total 62, expect to hit the 64-byte bucket
          224) # Total 280, expect to hit the 320-byte bucket
 
 
-SIZES = (9,  # Total 62, expect to hit the 64-byte bucket
-         10, # Total 72, expect to hit the 80-byte bucket
-         11, # Total 88, expect to hit the 96-byte bucket
-         12, # Total 120, expect to hit the 128-byte bucket
-         13, # Total 136, expect to hit the 160-byte bucket
-         14, # Total 184, expect to hit the 192-byte bucket
-         15, # Total 216, expect to hit the 224-byte bucket
-         16 # Total 248, expect to hit the 256-byte bucket
-         ) # Total 280, expect to hit the 320-byte bucket
+SIZES = (8,
+         32,
+         80,
+         128,
+         224)
+
 # A small sized and fixed value, ideally values never get allocated into a
 # bucket we're churning with keys
 VALUE_SIZE = 8
@@ -144,8 +141,8 @@ class AlwaysPromote:
 
 class Freeze:
 
-    def __init__(self, num_indexes, num_iterations, max_size):
-        self.num_indexes = num_indexes
+    def __init__(self, num_items, num_iterations, max_size):
+        self.num_items = num_items
         # Initialize deterministic pseudo-RNG for when to freeze docs.
         self.rng = random.Random(0)
         self.lock = multiprocessing.Lock()
@@ -172,19 +169,24 @@ class Freeze:
 
 class KeyFragger:
 
-    def __init__(self, num_indexes, num_workers, num_iterations, frozen_mode,
+    def __init__(self, num_items, num_workers, num_iterations, frozen_mode,
                  host, port, bucket, password):
 
         # See comment above SIZES list as to why we don't run bigger
-        # The test will try and write num_indexes * len(SIZES) keys...
-        assert num_indexes <= 9999999
+        # The test will try and write num_items * len(SIZES) keys...
+        assert num_items <= 9999999
 
-        self.num_indexes = num_indexes
+        self.num_items = num_items
         self.num_workers = num_workers
+
+        # 5000 items, 20 workers, 6 SIZES
+        # 250 per worker
+        # 41 per class,
+        items_per_worker = int(num_items / num_workers)
 
         max_size = SIZES[-1]
         if frozen_mode:
-            promotion_policy = Freeze(num_indexes, num_iterations, max_size)
+            promotion_policy = Freeze(num_items, num_iterations, max_size)
         else:
             promotion_policy = AlwaysPromote(max_size)
 
@@ -197,25 +199,34 @@ class KeyFragger:
         self.workers = list()
 
         start = 0
-        key_slice_size = int(num_indexes/num_workers)
+        key_slice_size = int(num_items/num_workers)
+        connection = {'host' : host,
+                      'port' : port,
+                      'bucket' : bucket,
+                      'password' : password}
         for i in range(self.num_workers):
+            partner = i - 1
+            if partner < 0:
+                partner = self.num_workers - 1
+
             if i == self.num_workers - 1:
                 # Last one is the Supervisor
                 t = Supervisor(number=i,
-                               host=host, port=port,
-                               bucket=bucket, password=password,
+                               partner=partner,
+                               connection=connection,
                                queues=self.queues,
                                in_queue=self.queues[i],
                                out_queue=self.queues[(i + 1) % self.num_workers],
                                promotion_policy=promotion_policy,
-                               num_indexes=self.num_indexes,
+                               num_items=items_per_worker,
                                num_iterations=num_iterations,
                                max_size=max_size,
-                               key_slice=(start, num_indexes))
+                               key_slice=(start, num_items))
             else:
                 t = Worker(number=i,
-                           host=host, port=port,
-                           bucket=bucket, password=password,
+                           partner=partner,
+                           connection=connection,
+                           num_items=items_per_worker,
                            in_queue=self.queues[i],
                            out_queue=self.queues[(i + 1) % self.num_workers],
                            promotion_policy=promotion_policy,
@@ -225,7 +236,7 @@ class KeyFragger:
 
     def run(self):
         logger.info('Starting KeyFragger: {} items, {} workers'.format(
-            self.num_indexes, self.num_workers))
+            self.num_items, self.num_workers))
 
         for t in self.workers:
             t.start()
@@ -235,28 +246,39 @@ class KeyFragger:
 
 class Worker(multiprocessing.Process):
 
-    def __init__(self, number, host, port, bucket, password, in_queue,
-                 out_queue, promotion_policy, key_slice):
+    def __init__(self,
+                 number,
+                 partner,
+                 connection,
+                 num_items,
+                 in_queue,
+                 out_queue,
+                 promotion_policy,
+                 key_slice):
         super().__init__()
         self.id = number
+        self.partner = partner
         self.in_queue = in_queue
         self.out_queue = out_queue
         self.promotion_policy = promotion_policy
-        self.bucket = bucket
-        self.password = password
-        self.host = host
-        self.port = port
+        self.connection = connection
         self.key_slice = key_slice
+        self.num_items = num_items
 
     def _connect(self):
         """Establish a connection to the Couchbase cluster."""
-        self.client = Couchbase.connect(host=self.host,
-                                        port=self.port,
-                                        bucket=self.bucket,
-                                        password=self.password,
+        self.client = Couchbase.connect(host=self.connection['host'],
+                                        port=self.connection['port'],
+                                        bucket=self.connection['bucket'],
+                                        password=self.connection['password'],
                                         username="Administrator")
 
     def run(self):
+        self._connect()
+
+        self._setup_my_slice()
+
+    def run1(self):
         """Run a Worker.
 
         They run essentially forever, taking document size iterators from the
@@ -308,9 +330,10 @@ class Worker(multiprocessing.Process):
     def _set_with_retry(self, key_prefix, keylen):
         success = False
         backoff = 0.01
+        # Set key is padded with the Worker's 'A' + id so we get A, B, C, etc...
         key='{prefix:{fill}{align}{width}}'.format(
                             prefix= key_prefix,
-                            fill='x',
+                            fill=chr(65+self.id),
                             align='<',
                             width=keylen)
         while not success:
@@ -327,9 +350,10 @@ class Worker(multiprocessing.Process):
     def _del_with_retry(self, key_prefix, keylen):
         success = False
         backoff = 0.01
+        # Del key is padded with the Worker's partner ID
         key='{prefix:{fill}{align}{width}}'.format(
                             prefix=key_prefix,
-                            fill='x',
+                            fill=chr(65+self.partner),
                             align='<',
                             width=keylen)
         while not success:
@@ -343,11 +367,18 @@ class Worker(multiprocessing.Process):
                 time.sleep(backoff)
                 backoff *= 2
 
-    def _set_my_key_slice(self):
-        for i in range(self.key_slice[0], self.key_slice[1]):
-            for s in SIZES:
+    # Setup the workers 'slice' of the total keys in the initial SIZES
+    def _setup_my_slice(self):
+        items_per_size_class = int(self.num_items/len(SIZES))
+        total = 0
+        for s in SIZES:
+            for i in range(items_per_size_class):
                 self._set_with_retry(i, s)
+                total = total + 1
 
+        # Fill in the gap with final size class
+        for i in range(total, self.num_items):
+            self._set_with_retry(i, SIZES[-1])
 
 class SequenceIterator:
     def __init__(self, max_size):
@@ -369,13 +400,25 @@ class Supervisor(Worker):
 
     SLEEP_TIME = 1
 
-    def __init__(self, number, host, port, bucket, password, queues, in_queue,
-                 out_queue, promotion_policy, num_indexes, num_iterations,
-                 max_size, key_slice):
-        super().__init__(number, host, port, bucket, password,
+    def __init__(self,
+                 number,
+                 partner,
+                 connection,
+                 queues,
+                 in_queue,
+                 out_queue,
+                 promotion_policy,
+                 num_items,
+                 num_iterations,
+                 max_size,
+                 key_slice):
+        super().__init__(number,
+                         partner,
+                         connection,
+                         num_items,
                          in_queue, out_queue, promotion_policy, key_slice)
         self.queues = queues
-        self.num_indexes = num_indexes
+        self.num_items = num_items
         self.num_iterations = num_iterations
         self.max_size = max_size
 
@@ -392,7 +435,9 @@ class Supervisor(Worker):
         # 'in' the separate process here.
         self._connect()
 
-        self._set_my_key_slice()
+        self._setup_my_slice()
+
+        return
 
         # Wait to receive the ready message from workers, this means everyon
         # has populate their key-slice and server memory should be stable
@@ -405,7 +450,7 @@ class Supervisor(Worker):
         logger.info('All workers have populated')
         # Create initial list of documents on the 'finished' queue
         finished_items = list()
-        for i in range(self.num_indexes):
+        for i in range(self.num_items):
             finished_items.append((i, 0))
 
         for iteration in range(self.num_iterations):
@@ -464,7 +509,7 @@ class Supervisor(Worker):
 
             logger.info('Completed iteration {}/{}, frozen {}/{} documents (aggregate)'.format(
                 iteration + 1, self.num_iterations,
-                self.num_indexes - len(finished_items), self.num_indexes))
+                self.num_items - len(finished_items), self.num_items))
             # Sleep at end of iteration to give disk write queue chance to drain.
             logger.info('Sleeping for {}s'.format(self.SLEEP_TIME))
             time.sleep(self.SLEEP_TIME)
@@ -495,7 +540,7 @@ class Supervisor(Worker):
 
 if __name__ == '__main__':
     # Small smoketest
-    # num_indexes * len(SIZES) is how many keys will be generated
-    KeyFragger(num_indexes=35000, num_workers=12, num_iterations=10,
+    # num_items * len(SIZES) is how many keys will be generated
+    KeyFragger(num_items=10000, num_workers=8, num_iterations=10,
              frozen_mode=True, host='localhost', port=9000,
              bucket='bucket-1', password='asdasd').run()
