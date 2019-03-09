@@ -116,65 +116,31 @@ SIZES1 = (8,  # Total 62, expect to hit the 64-byte bucket
          192, # Total 248, expect to hit the 256-byte bucket
          224) # Total 280, expect to hit the 320-byte bucket
 
-
-SIZES = (8,
-         32,
-         80,
-         128,
-         224)
+SIZES = ((8, 9, 10, 11, 12, 13, 14, 15),
+         (32, 34, 36, 38, 40, 42, 44, 46),
+         (80, 83, 86, 89, 92, 95, 98, 101),
+    (128, 131, 134, 137, 140,
+    143,
+    146,
+    149),
+    (224,
+    231,
+    238,
+    243, # approaching max key
+    223,
+    232,
+    235,
+    239))
 
 # A small sized and fixed value, ideally values never get allocated into a
 # bucket we're churning with keys
 VALUE_SIZE = 8
 VALUE = bytearray(121 for _ in range(VALUE_SIZE))
 
-class AlwaysPromote:
-
-    """Promotion policy for baseline case - always promote."""
-
-    def __init__(self, max_size):
-        self.max_size = max_size
-
-    def build_generator(self):
-        return SequenceIterator(self.max_size)
-
-
-class Freeze:
-
-    def __init__(self, num_items, num_iterations, max_size):
-        self.num_items = num_items
-        # Initialize deterministic pseudo-RNG for when to freeze docs.
-        self.rng = random.Random(0)
-        self.lock = multiprocessing.Lock()
-        # Aim to have 10% of documents left at the end.
-        self.freeze_probability = self._calc_freeze_probability(num_iterations=num_iterations,
-                                                                final_fraction=0.2)
-        self.max_size = max_size
-
-    def build_generator(self):
-        """Return a sequence of sizes which ramps from minimum to maximum size.
-
-        If 'freeze' is true, then freeze the sequence at a random position, i.e.
-        don't ramp all the way up to max_size.
-        """
-        if self.rng.random() < self.freeze_probability:
-            return SequenceIterator(self.rng.choice(SIZES[:SIZES.index(self.max_size)]))
-        else:
-            return SequenceIterator(self.max_size)
-
-    def _calc_freeze_probability(self, num_iterations, final_fraction):
-        """Return the freeze probability (per iteration)."""
-        return 1.0 - (final_fraction ** (1.0 / num_iterations))
-
-
 class KeyFragger:
 
     def __init__(self, num_items, num_workers, num_iterations, frozen_mode,
                  host, port, bucket, password):
-
-        # See comment above SIZES list as to why we don't run bigger
-        # The test will try and write num_items * len(SIZES) keys...
-        assert num_items <= 9999999
 
         self.num_items = num_items
         self.num_workers = num_workers
@@ -183,12 +149,6 @@ class KeyFragger:
         # 250 per worker
         # 41 per class,
         items_per_worker = int(num_items / num_workers)
-
-        max_size = SIZES[-1]
-        if frozen_mode:
-            promotion_policy = Freeze(num_items, num_iterations, max_size)
-        else:
-            promotion_policy = AlwaysPromote(max_size)
 
         # Create queues
         self.queues = list()
@@ -217,10 +177,8 @@ class KeyFragger:
                                queues=self.queues,
                                in_queue=self.queues[i],
                                out_queue=self.queues[(i + 1) % self.num_workers],
-                               promotion_policy=promotion_policy,
                                num_items=items_per_worker,
                                num_iterations=num_iterations,
-                               max_size=max_size,
                                key_slice=(start, num_items))
             else:
                 t = Worker(number=i,
@@ -229,7 +187,6 @@ class KeyFragger:
                            num_items=items_per_worker,
                            in_queue=self.queues[i],
                            out_queue=self.queues[(i + 1) % self.num_workers],
-                           promotion_policy=promotion_policy,
                            key_slice=(start, key_slice_size*i))
             start = (key_slice_size*i)
             self.workers.append(t)
@@ -243,6 +200,11 @@ class KeyFragger:
         for t in self.workers:
             t.join()
 
+STOP = 1
+GET_READY = 2
+SET = 3
+DELETE = 4
+ITERATION_DONE=5
 
 class Worker(multiprocessing.Process):
 
@@ -253,17 +215,16 @@ class Worker(multiprocessing.Process):
                  num_items,
                  in_queue,
                  out_queue,
-                 promotion_policy,
                  key_slice):
         super().__init__()
         self.id = number
         self.partner = partner
         self.in_queue = in_queue
         self.out_queue = out_queue
-        self.promotion_policy = promotion_policy
         self.connection = connection
         self.key_slice = key_slice
         self.num_items = num_items
+        self.iteration = 0
 
     def _connect(self):
         """Establish a connection to the Couchbase cluster."""
@@ -278,54 +239,25 @@ class Worker(multiprocessing.Process):
 
         self._setup_my_slice()
 
-    def run1(self):
-        """Run a Worker.
-
-        They run essentially forever, taking document size iterators from the
-        input queue and adding them to the output queue for the next guy.
-        """
-        # We defer creating the Couchbase object until we are actually 'in' the
-        # separate process here.
-        self._connect()
-
-        self._set_my_key_slice()
-        # Send ready message
-        self.out_queue.put((-2, None, -2))
 
         while True:
-            next_size = None
-            (i, doc, size) = self.in_queue.get()
-            # We use a "magic" null generator to terminate the workers
-            if not doc:
-                # Pass the message on...
-                self.out_queue.put((i, doc, size))
+            message = self.in_queue.get()
 
-                if i > 0 or i < -2:
-                    logger.warn('Worker-{0}: received unknown stop message {1}'.format(self.start, i))
-
-                # i = 0 or -2, go back to queue.get
-                if i == 0 or i == -2:
-                    continue
-
-                # i = -1, done, but set my slice first
-                if i == -1:
-                    self._set_my_key_slice()
-
+            if message == STOP:
+                self.out_queue.put(message)
                 break
-            # Actually perform the del/set.
-            try:
-                pre_size  = doc.previous()
-                next_size = doc.next()
 
-                # Delete the previous size class key
-                if pre_size:
-                    self._del_with_retry(str(i), pre_size)
+            if message == GET_READY or message == ITERATION_DONE:
+                self.out_queue.put(message)
+                continue
 
-                self._set_with_retry(str(i), next_size)
-                size = next_size
-            except StopIteration:
-                pass
-            self.out_queue.put((i, doc, size))
+            if message == DELETE:
+                self.out_queue.put(message)
+                self._delete()
+
+            if message == SET:
+                self.out_queue.put(message)
+                self._set()
 
     def _set_with_retry(self, key_prefix, keylen):
         success = False
@@ -373,27 +305,30 @@ class Worker(multiprocessing.Process):
         total = 0
         for s in SIZES:
             for i in range(items_per_size_class):
-                self._set_with_retry(i, s)
+                self._set_with_retry(i, s[0])
                 total = total + 1
 
         # Fill in the gap with final size class
         for i in range(total, self.num_items):
             self._set_with_retry(i, SIZES[-1])
 
-class SequenceIterator:
-    def __init__(self, max_size):
-        self.sizes = list(SIZES[:SIZES.index(max_size) + 1])
-        self.preSize = None
+    def _delete(self):
+        items_per_size_class = int(self.num_items/len(SIZES))
+        items_to_delete = items_per_size_class * 0.10
+        for s in SIZES:
+            for i in range(int(items_to_delete)):
+                self._del_with_retry(i, s[self.iteration])
 
-    def next(self):
-        if self.sizes:
-            self.preSize = self.sizes.pop(0)
-            return self.preSize
-        else:
-            raise StopIteration
+    def _set(self):
+        self.iteration = self.iteration + 1
+        if self.iteration >= 8:
+            self.iteration = 0
 
-    def previous(self):
-        return self.preSize
+        items_per_size_class = int(self.num_items/len(SIZES))
+        items_to_set = items_per_size_class * 0.10
+        for s in SIZES:
+            for i in range(int(items_to_set)):
+                self._set_with_retry(i, s[self.iteration])
 
 
 class Supervisor(Worker):
@@ -407,20 +342,17 @@ class Supervisor(Worker):
                  queues,
                  in_queue,
                  out_queue,
-                 promotion_policy,
                  num_items,
                  num_iterations,
-                 max_size,
                  key_slice):
         super().__init__(number,
                          partner,
                          connection,
                          num_items,
-                         in_queue, out_queue, promotion_policy, key_slice)
+                         in_queue, out_queue, key_slice)
         self.queues = queues
         self.num_items = num_items
         self.num_iterations = num_iterations
-        self.max_size = max_size
 
     def run(self):
         """Run the Supervisor.
@@ -435,112 +367,58 @@ class Supervisor(Worker):
         # 'in' the separate process here.
         self._connect()
 
+        self.out_queue.put(GET_READY)
         self._setup_my_slice()
+        message = self.in_queue.get()
+        logger.warn("EVERYONE READY")
+        time.sleep(20)
 
-        return
+        if message != GET_READY:
+            logger.warn("Supervisor start-up expected 2 got {0}".format(message))
 
-        # Wait to receive the ready message from workers, this means everyon
-        # has populate their key-slice and server memory should be stable
-        (i, _, _) = self.in_queue.get()
-        if i != -2:
-            logger.warn("Supervisor start-up expected -2 got {0}".format(i))
-
-        logger.info('All workers have populated')
-        time.sleep(30)
-        logger.info('All workers have populated')
-        # Create initial list of documents on the 'finished' queue
-        finished_items = list()
-        for i in range(self.num_items):
-            finished_items.append((i, 0))
-
+        mode = DELETE
         for iteration in range(self.num_iterations):
+            if mode == DELETE:
+                logger.info('Running delete phase')
+                self.out_queue.put(DELETE)
+                self._delete()
+            if mode == SET:
+                logger.info('Running set phase')
+                self.out_queue.put(SET)
+                self._set()
 
-            # Create a tuple for each item in the finished queue, of
-            # (doc_id, generator, doc_size). For the first iteration
-            # this will be all items, for subsequent iterations it may
-            # be fewer if some have been frozen.
-            # Spread these across the input queues of all workers, to ensure
-            # that each worker operates on different sizes.
-            expected_items = len(finished_items)
-            num_queues = len(self.queues)
-            for (i, size) in list(finished_items):
-                queue_index = i % num_queues
-                self.queues[queue_index].put(
-                    (i,
-                     self.promotion_policy.build_generator(),
-                     0))
-            finished_items = list()
+            message = self.in_queue.get()
 
-            while expected_items > 0:
-                (i, doc, size) = self.in_queue.get()
-                # Ignore the extra ready messages of which we should get one per
-                # worker
-                if not doc:
-                    if i != -2:
-                        logger.warn("Supervisor running expected -2 got {0}".format(i))
-                    continue
-                try:
-                    pre_size = doc.previous()
+            if message != mode:
+                logger.warn("Supervisor run expected {0} got {1}".format(mode, message))
 
-                    # Delete the previous size class key
-                    if pre_size:
-                        self._del_with_retry(str(i), pre_size)
+            # Loop this message around, when it comes back we know all Workers
+            # are done
+            self.out_queue.put(ITERATION_DONE)
+            message = self.in_queue.get()
+            if message != ITERATION_DONE:
+                logger.warn("Supervisor run expected NEXT_ITERATION {0} got {1}".format(ITERATION_DONE, message))
 
-                    next_size = doc.next()
-                    self._set_with_retry(str(i), next_size)
-                    size = next_size
-                    self.out_queue.put((i, doc, size))
-                except StopIteration:
-                    # Note: Items are not put back on out_queue at end of an
-                    # iteration (unlike Worker), instead we keep for the next
-                    # iteration, to build the new generators.
-                    finished_items.append((i, size))
-                    if len(finished_items) == expected_items:
-                        # Got all items, end of iteration.
-                        break
-
-            assert self.in_queue.empty()
-            assert self.out_queue.empty()
-
-            # Any finished items which didn't reach max size should be
-            # removed from the next iteration - we want to leave them
-            # frozen at their last size.
-            finished_items = [(ii, sz) for (ii, sz) in finished_items if sz == self.max_size]
-
-            logger.info('Completed iteration {}/{}, frozen {}/{} documents (aggregate)'.format(
-                iteration + 1, self.num_iterations,
-                self.num_items - len(finished_items), self.num_items))
-            # Sleep at end of iteration to give disk write queue chance to drain.
+            logger.info('Completed iteration {0}/{1}'.format(
+                iteration + 1, self.num_iterations))
             logger.info('Sleeping for {}s'.format(self.SLEEP_TIME))
             time.sleep(self.SLEEP_TIME)
+            if mode == DELETE:
+                mode = SET
+            else:
+                mode = DELETE
 
-        # All iterations complete.
+        # If we ended with DEL, finish with a SET phase
+        if mode == DEL:
+            self.out_queue.put(SET)
+            logger.info('Finishing with set phase')
+            self._set()
 
-        # Shutdown in two passes, first pass ensures that workers stop set/del
-        # Second pass triggers them to just set their key slice and end
-
-        # First send a special None, 0 message to get workers to stop work
-        self.out_queue.put((0, None, 0))
-        (i, doc, _) = self.in_queue.get()
-
-        # All workers read the message as we have received it
-        if not doc:
-            if i != 0:
-                logger.warn('Supervisor shutdown expected 0 got {0}'.format(i))
-            # Second send a special None, -1 message to get workers to finalise
-            # their key-slice and shutdown
-            self.out_queue.put((-1, None, -1))
-        else:
-           logger.warn('Supervisor shutdown expected None doc got doc:{0}'.format(doc))
-
-        (i, _, _) = self.in_queue.get()
-        if i != -1:
-            logger.warn('Supervisor shutdown expected -1 got {0}'.format(i))
-        self._set_my_key_slice()
+        logger.info('Supervisor issuing STOP')
+        self.out_queue.put(STOP)
 
 if __name__ == '__main__':
     # Small smoketest
-    # num_items * len(SIZES) is how many keys will be generated
-    KeyFragger(num_items=10000, num_workers=8, num_iterations=10,
+    KeyFragger(num_items=1000000, num_workers=8, num_iterations=20,
              frozen_mode=True, host='localhost', port=9000,
              bucket='bucket-1', password='asdasd').run()
