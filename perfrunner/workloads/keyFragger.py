@@ -85,8 +85,12 @@ the given number of iterations.
 import multiprocessing
 import random
 import time
+import subprocess
 
-from couchbase import FMT_BYTES, Couchbase, exceptions
+from couchbase import FMT_BYTES, exceptions
+from couchbase.connection import Connection
+from couchbase.cluster import Cluster
+from couchbase.cluster import PasswordAuthenticator
 
 from logger import logger
 
@@ -96,58 +100,36 @@ from logger import logger
 # The final size is smaller though to keep our generated keys under the max size
 # of memcached keys (250 bytes)
 
-# The test is geared around some knowledge of KV-engine
-# * A stored-value is 56 bytes (as of git-sha 50b6ead0)
-# * JEMalloc is the memory allocator
-# The SIZES list determines what length keys to create, this is the total padded
-# size, i.e. len(prefix + padding) == size.
-# The prefix is our current key index, which is just a number and thus ranges
-# from 0 to a theoretical max of 9,999,999.
-# Hence the first size of 8 allows for keys "0xxxxxxx" and "9999999x" and these
-# should in-theory be allocated out of the 64-byte bucket (6 + 56 = 62).
-# The last size is chosen to ensure we generate legal memcached keys
-SIZES1 = (8,  # Total 62, expect to hit the 64-byte bucket
-         16, # Total 72, expect to hit the 80-byte bucket
-         32, # Total 88, expect to hit the 96-byte bucket
-         64, # Total 120, expect to hit the 128-byte bucket
-         80, # Total 136, expect to hit the 160-byte bucket
-         128, # Total 184, expect to hit the 192-byte bucket
-         160, # Total 216, expect to hit the 224-byte bucket
-         192, # Total 248, expect to hit the 256-byte bucket
-         224) # Total 280, expect to hit the 320-byte bucket
+# sizeof(StoredValue) = 56
+# 1 byte for collection-id
+# 1 byte for key-length which is stored inside the SerialDocKey part of SV
+SV_SIZE=56+1+1
 
-SIZES = ((8, 9, 10, 11, 12, 13, 14, 15),
-         (32, 34, 36, 38, 40, 42, 44, 46),
-         (80, 83, 86, 89, 92, 95, 98, 101),
-    (128, 131, 134, 137, 140,
-    143,
-    146,
-    149),
-    (224,
-    231,
-    238,
-    243, # approaching max key
-    223,
-    232,
-    235,
-    239))
+SIZES=[]
+# 304 isn't a real bin, but we want to hit the 320 bin but not violate the 250
+# byte key limit
+BINS=[80, 96, 112, 128, 160, 192, 224, 256, 304]
 
 # A small sized and fixed value, ideally values never get allocated into a
-# bucket we're churning with keys
+# bin we're churning with keys
 VALUE_SIZE = 8
 VALUE = bytearray(121 for _ in range(VALUE_SIZE))
 
 class KeyFragger:
 
-    def __init__(self, num_items, num_workers, num_iterations, frozen_mode,
+    def __init__(self, num_items, num_workers, cycles,
                  host, port, bucket, password):
 
         self.num_items = num_items
         self.num_workers = num_workers
 
-        # 5000 items, 20 workers, 6 SIZES
-        # 250 per worker
-        # 41 per class,
+        # Setup the key sizes, go big to small
+        for b in reversed(BINS):
+            SIZES.append(b - SV_SIZE)
+
+        logger.debug(SIZES)
+
+        # 400 / 4 = 100
         items_per_worker = int(num_items / num_workers)
 
         # Create queues
@@ -159,11 +141,11 @@ class KeyFragger:
         self.workers = list()
 
         start = 0
-        key_slice_size = int(num_items/num_workers)
         connection = {'host' : host,
                       'port' : port,
                       'bucket' : bucket,
                       'password' : password}
+
         for i in range(self.num_workers):
             partner = i - 1
             if partner < 0:
@@ -178,8 +160,7 @@ class KeyFragger:
                                in_queue=self.queues[i],
                                out_queue=self.queues[(i + 1) % self.num_workers],
                                num_items=items_per_worker,
-                               num_iterations=num_iterations,
-                               key_slice=(start, num_items))
+                               cycles=cycles)
             else:
                 t = Worker(number=i,
                            partner=partner,
@@ -187,8 +168,7 @@ class KeyFragger:
                            num_items=items_per_worker,
                            in_queue=self.queues[i],
                            out_queue=self.queues[(i + 1) % self.num_workers],
-                           key_slice=(start, key_slice_size*i))
-            start = (key_slice_size*i)
+                           cycles=cycles)
             self.workers.append(t)
 
     def run(self):
@@ -204,7 +184,7 @@ STOP = 1
 GET_READY = 2
 SET = 3
 DELETE = 4
-ITERATION_DONE=5
+NEXT_CYCLE = 5
 
 class Worker(multiprocessing.Process):
 
@@ -215,30 +195,66 @@ class Worker(multiprocessing.Process):
                  num_items,
                  in_queue,
                  out_queue,
-                 key_slice):
+                 cycles):
         super().__init__()
+
         self.id = number
         self.partner = partner
         self.in_queue = in_queue
         self.out_queue = out_queue
         self.connection = connection
-        self.key_slice = key_slice
+
+
         self.num_items = num_items
         self.iteration = 0
 
+        # How many keys per cycle
+        self.cycles = cycles
+        self.cycle_keys = int(num_items / cycles)
+
+        # each cycle shifts into a new range c1:0-10, c2:11-20 etc...
+        self.cycle_offset = 0
+        self.state = {}
+        # Initialise moves to the next cycle
+        self._reset()
+
+        # First cycle offset is 0, undo what _reset did
+        self.cycle_offset = 0
+
+    def _reset(self):
+        self.cycle_offset += self.cycle_keys
+        self.state.clear()
+        # We think of each size as a bucket, we will move keys over the buckets
+        for s in SIZES:
+            # Create a state dictionary for all the 'buckets'
+            # Start state is 0.0% full
+            # Target state is where we want each bucket to be after all
+            # cycles complete, i.e. 25% if we had 4 buckets
+            self.state[s] = {'perc' : None,
+                              'target' : 100.0/len(SIZES),
+                              'curr_items' : 0,
+                              'removed' : 0}
+
+        # The 0 or start bucket is seeded, it's 100% for the cycle
+        self.state[SIZES[0]]['perc'] = 100.0
+        self.state[SIZES[0]]['curr_items'] = self.cycle_keys
+
+    def new_iteration(self):
+        return
+
     def _connect(self):
         """Establish a connection to the Couchbase cluster."""
-        self.client = Couchbase.connect(host=self.connection['host'],
-                                        port=self.connection['port'],
-                                        bucket=self.connection['bucket'],
-                                        password=self.connection['password'],
-                                        username="Administrator")
+        cluster = Cluster('http://{}:{}'.format(self.connection['host'], self.connection['port']))
+        authenticator = PasswordAuthenticator('Administrator', self.connection['password'])
+        cluster.authenticate(authenticator)
+        self.client = cluster.open_bucket(self.connection['bucket'])
 
     def run(self):
         self._connect()
 
-        self._setup_my_slice()
-
+        # Do setup before reading/posting on the queues, so the setup happens
+        # 'concurrently' on all worker
+        self._setup()
 
         while True:
             message = self.in_queue.get()
@@ -247,17 +263,23 @@ class Worker(multiprocessing.Process):
                 self.out_queue.put(message)
                 break
 
-            if message == GET_READY or message == ITERATION_DONE:
+            if message == NEXT_CYCLE:
+                self._reset()
+                self.out_queue.put(message)
+
+            if message == GET_READY:
                 self.out_queue.put(message)
                 continue
 
             if message == DELETE:
                 self.out_queue.put(message)
-                self._delete()
+                self.do_deletes()
 
             if message == SET:
                 self.out_queue.put(message)
-                self._set()
+                self.do_sets()
+
+
 
     def _set_with_retry(self, key_prefix, keylen):
         success = False
@@ -299,41 +321,79 @@ class Worker(multiprocessing.Process):
                 time.sleep(backoff)
                 backoff *= 2
 
-    # Setup the workers 'slice' of the total keys in the initial SIZES
-    def _setup_my_slice(self):
-        items_per_size_class = int(self.num_items/len(SIZES))
-        total = 0
-        for s in SIZES:
-            for i in range(items_per_size_class):
-                self._set_with_retry(i, s[0])
-                total = total + 1
+    def do_deletes(self):
+        for s in SIZES[:-1]:
+            self._delete(s)
 
-        # Fill in the gap with final size class
-        for i in range(total, self.num_items):
-            self._set_with_retry(i, SIZES[-1])
+    def do_sets(self):
+        for s in range(len(SIZES) - 1):
+                self._set(SIZES[s], SIZES[s+1])
 
-    def _delete(self):
-        items_per_size_class = int(self.num_items/len(SIZES))
-        items_to_delete = items_per_size_class * 0.10
-        for s in SIZES:
-            for i in range(int(items_to_delete)):
-                self._del_with_retry(i, s[self.iteration])
+    def _setup(self):
+        # SETUP. populate the first bucket with 100% of the keys for all cycles
+        self._setup_my_slice(SIZES[0], self.cycle_keys * self.cycles)
 
-    def _set(self):
-        self.iteration = self.iteration + 1
-        if self.iteration >= 8:
-            self.iteration = 0
+    # s size of key
+    # n number of keys
+    def _setup_my_slice(self, s, n):
 
-        items_per_size_class = int(self.num_items/len(SIZES))
-        items_to_set = items_per_size_class * 0.10
-        for s in SIZES:
-            for i in range(int(items_to_set)):
-                self._set_with_retry(i, s[self.iteration])
+        logger.debug("Worker: setup issuing {} sets of size:{}.".format(n, s))
+        for i in range(n):
+            self._set_with_retry(i, s)
+        self.state[s]['bound'] = n
 
+    def _delete(self, src):
+        if self.state[src]['perc'] and self.state[src]['perc'] <= self.state[src]['target']:
+            logger.debug("     Skipping1 DEL from {0} s:{1}".format(src, self.state[src]))
+            return
+        if self.state[src]['curr_items'] == 0:
+            logger.debug("     Skipping2 DEL from {0} s:{1}".format(src, self.state[src]))
+            return
+
+        # Compute deletes for this iteration
+        # aim to reduce this bucket to target% of cycle keys
+        deletes = self.state[src]['curr_items'] - int(self.cycle_keys * (self.state[src]['target']/100.0))
+
+        start = self.cycle_offset + self.state[src]['removed']
+
+        logger.debug("Worker: issuing {} deletes of key size:{} range:{}-{}. state:{}".format(deletes, src, start, start+deletes, self.state[src]))
+        bound = self.state[src]['bound']
+        for i in range(start, (start+deletes)):
+             self._del_with_retry(i, src)
+
+        self.state[src]['curr_items'] -= deletes
+        self.state[src]['perc'] = (self.state[src]['curr_items'] / self.cycle_keys) * 100.0
+        self.state[src]['removed'] += deletes
+
+    def _set(self, src, dst):
+        # source is empty
+        if self.state[src]['curr_items'] == 0 or self.state[src]['removed'] == 0:
+            logger.debug("     Skipping1 SET from {0} to {1} s:{2} d:{3}".format(src, dst,  self.state[src],  self.state[dst] ))
+            return
+        # dest is at (or below) target
+        if self.state[dst]['perc'] and self.state[dst]['perc'] <= self.state[dst]['target']:
+            logger.debug("     Skipping2 SET from {0} to {1} s:{2} d:{3}".format(src, dst,  self.state[src],  self.state[dst] ))
+            return
+
+        sets = self.state[src]['removed']
+
+        start = self.cycle_offset
+
+        logger.debug("Worker: issuing {} sets of size:{}. offset:{} range:{}-{} ".format(sets, dst,  self.cycle_offset, start, start+sets))
+
+        # Set into dst what was removed from src
+        for i in range(start, start + sets):
+             self._set_with_retry(i, dst)
+
+
+        # Update dst state
+        self.state[dst]['perc'] = (sets / self.cycle_keys) * 100.0
+        self.state[dst]['curr_items'] += sets
+        self.state[dst]['bound'] = start + sets
 
 class Supervisor(Worker):
 
-    SLEEP_TIME = 1
+    SLEEP_TIME = 2
 
     def __init__(self,
                  number,
@@ -343,82 +403,89 @@ class Supervisor(Worker):
                  in_queue,
                  out_queue,
                  num_items,
-                 num_iterations,
-                 key_slice):
+                 cycles):
         super().__init__(number,
                          partner,
                          connection,
                          num_items,
-                         in_queue, out_queue, key_slice)
+                         in_queue,
+                         out_queue,
+                         cycles)
         self.queues = queues
         self.num_items = num_items
-        self.num_iterations = num_iterations
+
+        # The Supervisor work loop runs in a SET phase then switches to DEL
+        # hence why we double based on the number of SIZES
+        self.num_iterations = len(SIZES) * 2
+        self.cycles = cycles
 
     def run(self):
-        """Run the Supervisor.
-
-        This is similar to Worker, except that completed documents are not
-        added back to the output queue. When the last document is seen as
-        completed, a new iteration is started.
-        """
         logger.info('Starting KeyFragger supervisor')
 
-        # We defer creating the Couchbase object until we are actually
-        # 'in' the separate process here.
         self._connect()
 
         self.out_queue.put(GET_READY)
-        self._setup_my_slice()
-        message = self.in_queue.get()
-        logger.warn("EVERYONE READY")
-        time.sleep(20)
 
-        if message != GET_READY:
-            logger.warn("Supervisor start-up expected 2 got {0}".format(message))
+        self._setup()
 
-        mode = DELETE
-        for iteration in range(self.num_iterations):
-            if mode == DELETE:
-                logger.info('Running delete phase')
-                self.out_queue.put(DELETE)
-                self._delete()
-            if mode == SET:
-                logger.info('Running set phase')
-                self.out_queue.put(SET)
-                self._set()
+        sleepTime = 0
 
+        for cycle in range(self.cycles):
             message = self.in_queue.get()
-
-            if message != mode:
-                logger.warn("Supervisor run expected {0} got {1}".format(mode, message))
-
-            # Loop this message around, when it comes back we know all Workers
-            # are done
-            self.out_queue.put(ITERATION_DONE)
-            message = self.in_queue.get()
-            if message != ITERATION_DONE:
-                logger.warn("Supervisor run expected NEXT_ITERATION {0} got {1}".format(ITERATION_DONE, message))
-
-            logger.info('Completed iteration {0}/{1}'.format(
-                iteration + 1, self.num_iterations))
-            logger.info('Sleeping for {}s'.format(self.SLEEP_TIME))
-            time.sleep(self.SLEEP_TIME)
-            if mode == DELETE:
-                mode = SET
+            if message != GET_READY and message != NEXT_CYCLE:
+                logger.warn(
+                    "Supervisor: cycle {0} expected {1} or {2} but got {3}"
+                        .format(cycle, GET_READY, NEXT_CYCLE, message))
             else:
-                mode = DELETE
+                logger.info("Supervisor: All workers completed cycle setup")
 
-        # If we ended with DEL, finish with a SET phase
-        if mode == DEL:
-            self.out_queue.put(SET)
-            logger.info('Finishing with set phase')
-            self._set()
 
-        logger.info('Supervisor issuing STOP')
+            mode = DELETE
+            for iteration in range(self.num_iterations):
+                if mode == DELETE:
+                    logger.info('Supervisor: Running delete phase')
+                    self.out_queue.put(DELETE)
+                    self.do_deletes()
+                    # Deletes need to persist for the memory to be freed
+                    sleepTime = 0
+
+                if mode == SET:
+                    logger.info('Supervisor: Running set phase')
+                    self.out_queue.put(SET)
+                    self.do_sets()
+                    sleepTime = 0
+
+                message = self.in_queue.get()
+
+                if message != mode:
+                    logger.warn("Supervisor: run expected {0} got {1}".format(mode, message))
+
+
+                logger.info('Supervisor: Completed iteration {0}/{1}'.format(
+                    iteration + 1, self.num_iterations))
+                logger.info('Supervisor:  Sleeping for {}s'.format(sleepTime))
+                time.sleep(sleepTime)
+
+                # Switch phase
+                if mode == DELETE:
+                    mode = SET
+                else:
+                    mode = DELETE
+
+            logger.info("Supervisor Finished cycle {0}/{1}".format(cycle+1, self.cycles))
+            self.out_queue.put(NEXT_CYCLE)
+            self._reset()
+
+        logger.info('Supervisor: issuing STOP')
         self.out_queue.put(STOP)
 
 if __name__ == '__main__':
+
     # Small smoketest
-    KeyFragger(num_items=1000000, num_workers=8, num_iterations=20,
-             frozen_mode=True, host='localhost', port=9000,
-             bucket='bucket-1', password='asdasd').run()
+    KeyFragger(num_items=100000,
+               num_workers=8,
+               cycles=1,
+               host='localhost',
+               port=9000,
+               bucket='bucket-1',
+               password='asdasd').run()
